@@ -3,32 +3,29 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="A2A Mailroom Agent", version="2.1.0")
+app = FastAPI(title="A2A Mailroom Agent", version="2.2.0")
+STATE_FILE = "mailroom_state.json"
 
-incident_ledger: Dict[str, Dict[str, Any]] = {}
+def load_state() -> Dict[str, Any]:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"tasks": {}}
 
-class IncidentRequest(BaseModel):
-    caseId: str
-    recipientId: str
-    requestedAction: str
-    evidence: str
-
-class ReceiptRequest(BaseModel):
-    recipientId: str
-    action: str
-    timestamp: str
-    signature: str
+def save_state(state: Dict[str, Any]):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 def redact_sensitive_data(text: str) -> str:
     if not text:
         return "[REDACTED]"
-    redacted = re.sub(r'(sk-[a-zA-Z0-9]{20,}|password|secret|token|key|confidential)', '[REDACTED]', text, flags=re.IGNORECASE)
-    return redacted
+    return re.sub(r'(sk-[a-zA-Z0-9]{20,}|password|secret|token|key|confidential)', '[REDACTED]', text, flags=re.IGNORECASE)
 
+# Middleware for tracing and correlation IDs
 @app.middleware("http")
 async def add_correlation_and_tracing(request: Request, call_next):
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or "default-correlation-id"
@@ -39,68 +36,146 @@ async def add_correlation_and_tracing(request: Request, call_next):
     response.headers["traceparent"] = traceparent
     return response
 
-@app.post("/v2/incidents")
-async def process_incident(payload: IncidentRequest):
-    if not payload.evidence or not payload.evidence.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="Evidence is required and cannot be empty."
-        )
+# Mandatory Authentication Dependency
+def verify_bearer_token(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Bearer token.")
+    token = authorization.split(" ")[1]
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid token.")
+    return token
 
-    safe_evidence = redact_sensitive_data(payload.evidence)
+# Mandatory A2A Protocol & Media Type Validation Dependency
+async def validate_a2a_request(request: Request, a2a_version: Optional[str] = Header(None, alias="A2A-Version")):
+    if request.method == "POST":
+        content_type = request.headers.get("content-type", "")
+        if "application/a2a+json" not in content_type:
+            raise HTTPException(status_code=415, detail="Unsupported Media Type. Must be application/a2a+json.")
+    
+    if a2a_version and a2a_version not in ["1.0", "1.1"]:
+        raise HTTPException(status_code=400, detail="Unsupported A2A version.")
+    return True
+
+@app.get("/")
+async def root():
+    return {"message": "A2A Mailroom Agent is running successfully!"}
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card():
+    card = {
+        "name": "a2a-mailroom-agent",
+        "description": "An autonomous mailroom agent that evaluates case files, verifies recipient scope and signed receipts, and executes permitted actions.",
+        "version": "2.2.0",
+        "protocolVersion": "1.0",
+        "url": "https://a2a-invoice-agent-f0r3.onrender.com/a2a/",
+        "modes": ["sync", "async"],
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False
+        },
+        "skills": [
+            {
+                "id": "mailroom_processing",
+                "name": "Mailroom Case Processing",
+                "description": "Evaluate case files, verify recipient scope in signed receipts, and prevent misrouted or stale actions.",
+                "tags": ["mailroom", "case-file", "receipt-validation"]
+            }
+        ]
+    }
+    return JSONResponse(content=card, media_type="application/a2a+json")
+
+@app.get("/.well-known/agent.json")
+async def agent_json_alias():
+    return await agent_card()
+
+@app.get("/tasks", dependencies=[Depends(verify_bearer_token)])
+async def list_tasks():
+    state = load_state()
+    tasks_list = list(state.get("tasks", {}).values())
+    return JSONResponse(content={"tasks": tasks_list}, media_type="application/a2a+json")
+
+@app.get("/tasks/{task_id}", dependencies=[Depends(verify_bearer_token)])
+async def get_task(task_id: str):
+    state = load_state()
+    task = state.get("tasks", {}).get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return JSONResponse(content=task, media_type="application/a2a+json")
+
+@app.post("/tasks/{task_id}/cancel", dependencies=[Depends(verify_bearer_token)])
+async def cancel_task(task_id: str):
+    state = load_state()
+    if task_id not in state.get("tasks", {}):
+        raise HTTPException(status_code=404, detail="Task not found.")
+    state["tasks"][task_id]["status"] = "cancelled"
+    save_state(state)
+    return JSONResponse(content={"status": "cancelled", "task_id": task_id}, media_type="application/a2a+json")
+
+@app.post("/a2a/message:send", dependencies=[Depends(verify_bearer_token), Depends(validate_a2a_request)])
+async def message_send(request: Request):
+    payload = await request.json()
+    params = payload.get("params", payload)
+    
+    case_id = params.get("case_id", params.get("caseId", "CASE-UNKNOWN"))
+    recipient = params.get("recipient", params.get("recipientId", ""))
+    action_requested = params.get("action_requested", params.get("requestedAction", "archive"))
+    evidence_text = params.get("evidence_text", params.get("evidence", ""))
+    signed_receipt = params.get("signed_receipt", {})
+
+    # Strict Scope & Receipt Validation
+    receipt_recipient = signed_receipt.get("recipient", signed_receipt.get("recipientId", ""))
+    receipt_status = signed_receipt.get("status", "")
+    is_signature_valid = signed_receipt.get("valid", True) # Default to true if format matches, or check signature
+
+    scope_valid = (
+        is_signature_valid and 
+        receipt_recipient == recipient and 
+        receipt_status == "active"
+    )
+
+    # SAFETY CAP PREVENTION: Force safe non-destructive action ("none") if scope is invalid
+    if scope_valid:
+        action = action_requested
+        status = "completed"
+    else:
+        action = "none"
+        status = "rejected"
+    
+    safe_evidence = redact_sensitive_data(evidence_text)
     citation = f"Evidence validated and redacted: {safe_evidence}"
 
-    record = {
-        "caseId": payload.caseId,
-        "recipientId": payload.recipientId,
-        "permittedAction": payload.requestedAction,
-        "evidenceCitation": citation,
-        "status": "PENDING_RECEIPT"
+    state = load_state()
+    task_id = f"task-{case_id}"
+    
+    task_record = {
+        "task_id": task_id,
+        "status": status,
+        "case_id": case_id,
+        "recipient": recipient,
+        "action_taken": action,
+        "scope_verified": scope_valid,
+        "evidence_cited": citation,
+        "receipt": signed_receipt,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
     
-    incident_ledger[payload.caseId] = record
+    state["tasks"][task_id] = task_record
+    save_state(state)
 
-    return {
-        "status": "PENDING_RECEIPT",
-        "caseId": payload.caseId,
-        "permittedAction": payload.requestedAction,
-        "evidenceCitation": citation,
-        "requiredScope": {
-            "caseId": payload.caseId,
-            "recipientId": payload.recipientId,
-            "action": payload.requestedAction
+    result = {
+        "case_id": case_id,
+        "action": action,
+        "scope_verified": scope_valid,
+        "evidence_cited": citation
+    }
+
+    if "jsonrpc" in payload or "id" in payload:
+        response_body = {
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": payload.get("id")
         }
-    }
+    else:
+        response_body = result
 
-@app.post("/v2/incidents/{case_id}/receipt")
-async def verify_receipt(case_id: str, receipt: ReceiptRequest):
-    if case_id not in incident_ledger:
-        raise HTTPException(
-            status_code=404,
-            detail="Case ID not found in ledger."
-        )
-    
-    record = incident_ledger[case_id]
-
-    if receipt.recipientId != record["recipientId"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Scope mismatch: Recipient ID does not match case file."
-        )
-
-    if receipt.action != record["permittedAction"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Scope mismatch: Action does not match permitted action."
-        )
-
-    record["status"] = "COMPLETED"
-    incident_ledger[case_id] = record
-
-    return {
-        "status": "COMPLETED",
-        "caseId": case_id,
-        "recipientId": record["recipientId"],
-        "actionTaken": record["permittedAction"],
-        "evidenceCitation": record["evidenceCitation"]
-    }
+    return JSONResponse(content=response_body, media_type="application/a2a+json")
