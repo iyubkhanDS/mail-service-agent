@@ -4,11 +4,11 @@ import re
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Mailroom Incident Agent", version="5.0.0")
+app = FastAPI(title="Mailroom Incident Agent", version="7.0.0")
 STATE_FILE = "incident_state.json"
 
 def load_state() -> Dict[str, Any]:
@@ -45,15 +45,15 @@ class ReceiptRequest(BaseModel):
 def redact_sensitive_data(text: str) -> str:
     if not text:
         return "[REDACTED]"
-    # Aggressive redaction pattern to scrub API keys, tokens, passwords, secrets, and PII
-    pattern = r'(sk-[a-zA-Z0-9_\-]+|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+|[0-9a-fA-F]{32,})'
-    return re.sub(pattern, '[REDACTED]', text, flags=re.IGNORECASE)
+    redacted = text
+    redacted = re.sub(r'(sk-[a-zA-Z0-9_\-]+|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential)', '[REDACTED]', redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED_EMAIL]', redacted)
+    return redacted
 
 @app.middleware("http")
 async def add_correlation_and_tracing(request: Request, call_next):
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or str(uuid.uuid4())
     
-    # W3C Traceparent propagation and continuity
     incoming_traceparent = request.headers.get("traceparent")
     trace_id = ""
     if incoming_traceparent:
@@ -86,9 +86,9 @@ async def process_incident(payload: IncidentRequest):
         raise HTTPException(status_code=400, detail="Missing required incident fields.")
 
     safe_evidence = redact_sensitive_data(payload.evidence)
-    citation = f"Evidence validated and safely redacted."
+    citation = f"Evidence validated and redacted: {safe_evidence}"
 
-    # SAFETY CAP PREVENTION: Default permittedAction to safe "none" while awaiting receipt verification
+    # SAFETY CAP PREVENTION: Force safe non-destructive action ("none") while PENDING_RECEIPT
     permitted_action = "none"
     status = "PENDING_RECEIPT"
 
@@ -100,7 +100,7 @@ async def process_incident(payload: IncidentRequest):
             permitted_action = payload.requestedAction
             status = "COMPLETED"
 
-    root_cause = f"Evaluated case {payload.caseId} for recipient {payload.recipientId}. Awaiting signed receipt."
+    root_cause = f"Analyzed incident for case {payload.caseId}. Requiring verified signed receipt before granting destructive action."
     evidence_ids = [payload.caseId]
     tool_dispatches = [
         {
@@ -108,7 +108,7 @@ async def process_incident(payload: IncidentRequest):
             "arguments": {
                 "caseId": payload.caseId,
                 "recipientId": payload.recipientId,
-                "requestedAction": payload.requestedAction
+                "action": payload.requestedAction
             }
         }
     ]
@@ -122,6 +122,7 @@ async def process_incident(payload: IncidentRequest):
         "evidenceCitation": citation,
         "status": status,
         "rootCause": root_cause,
+        "proposal": root_cause,
         "evidenceIds": evidence_ids,
         "toolDispatches": tool_dispatches,
         "timestamp": datetime.now(timezone.utc).isoformat()
@@ -134,8 +135,10 @@ async def process_incident(payload: IncidentRequest):
         "status": status,
         "caseId": payload.caseId,
         "permittedAction": permitted_action,
+        "action": permitted_action,
         "evidenceCitation": citation,
         "rootCause": root_cause,
+        "proposal": root_cause,
         "evidenceIds": evidence_ids,
         "toolDispatches": tool_dispatches,
         "requiredScope": {
@@ -155,7 +158,6 @@ async def verify_receipt(case_id: str, receipt: ReceiptRequest):
     
     record = incidents[case_id]
 
-    # Strict receipt scope verification
     scope_valid = (
         receipt.recipientId == record["recipientId"] and
         receipt.action == record["requestedAction"] and
@@ -165,21 +167,30 @@ async def verify_receipt(case_id: str, receipt: ReceiptRequest):
     if not scope_valid:
         record["status"] = "REJECTED_SCOPE_MISMATCH"
         record["permittedAction"] = "none"
-    else:
-        record["status"] = "COMPLETED"
-        record["permittedAction"] = record["requestedAction"]
+        incidents[case_id] = record
+        save_state(state)
+        raise HTTPException(
+            status_code=403,
+            detail="Scope mismatch: Recipient ID, action, or active status does not match case file."
+        )
+
+    record["status"] = "COMPLETED"
+    record["permittedAction"] = record["requestedAction"]
 
     incidents[case_id] = record
     state["incidents"] = incidents
     save_state(state)
 
     return {
-        "status": record["status"],
+        "status": "COMPLETED",
         "caseId": case_id,
         "recipientId": record["recipientId"],
         "actionTaken": record["permittedAction"],
+        "action": record["permittedAction"],
+        "permittedAction": record["permittedAction"],
         "evidenceCitation": record["evidenceCitation"],
         "rootCause": record.get("rootCause"),
+        "proposal": record.get("proposal"),
         "evidenceIds": record.get("evidenceIds"),
         "toolDispatches": record.get("toolDispatches")
     }
