@@ -5,10 +5,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Mailroom Incident Agent", version="4.0.0")
+app = FastAPI(title="Mailroom Incident Agent", version="4.1.0")
 STATE_FILE = "incident_state.json"
 
 def load_state() -> Dict[str, Any]:
@@ -29,7 +28,6 @@ class IncidentRequest(BaseModel):
     recipientId: str = Field(..., alias="recipientId")
     requestedAction: str = Field(..., alias="requestedAction")
     evidence: str = Field(..., alias="evidence")
-    receipt: Optional[Dict[str, Any]] = Field(default=None, alias="receipt")
     class Config:
         populate_by_name = True
 
@@ -37,7 +35,7 @@ class ReceiptRequest(BaseModel):
     recipientId: str = Field(..., alias="recipientId")
     action: str = Field(..., alias="action")
     status: Optional[str] = Field(default="active", alias="status")
-    timestamp: str = Field(..., alias="timestamp")
+    timestamp: Optional[str] = Field(default="", alias="timestamp")
     signature: Optional[str] = Field(default="", alias="signature")
     class Config:
         populate_by_name = True
@@ -45,31 +43,25 @@ class ReceiptRequest(BaseModel):
 def redact_sensitive_data(text: str) -> str:
     if not text:
         return "[REDACTED]"
-    # Comprehensive redaction for API keys, bearer tokens, passwords, secrets, PII
     pattern = r'(sk-[a-zA-Z0-9]{20,}|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
     return re.sub(pattern, '[REDACTED]', text, flags=re.IGNORECASE)
 
 @app.middleware("http")
 async def add_correlation_and_tracing(request: Request, call_next):
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or str(uuid.uuid4())
-    
-    # W3C Traceparent handling & topology propagation
     incoming_traceparent = request.headers.get("traceparent")
     trace_id = ""
     if incoming_traceparent:
         parts = incoming_traceparent.split("-")
         if len(parts) >= 2:
             trace_id = parts[1]
-    
     if not trace_id or len(trace_id) != 32:
-        trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:16] # 32 hex chars
+        trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:16]
         trace_id = trace_id[:32]
-
-    new_span_id = uuid.uuid4().hex[:16] # 16 hex chars
+    new_span_id = uuid.uuid4().hex[:16]
     outgoing_traceparent = f"00-{trace_id}-{new_span_id}-01"
 
     response = await call_next(request)
-    
     response.headers["x-correlation-id"] = correlation_id
     response.headers["x-request-id"] = correlation_id
     response.headers["traceparent"] = outgoing_traceparent
@@ -82,21 +74,17 @@ async def root():
 @app.post("/v2/incidents")
 async def process_incident(payload: IncidentRequest):
     if not payload.evidence or not payload.evidence.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="Evidence is required and cannot be empty."
-        )
+        raise HTTPException(status_code=422, detail="Evidence is required and cannot be empty.")
     if not payload.caseId or not payload.recipientId or not payload.requestedAction:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing required incident fields (caseId, recipientId, requestedAction)."
-        )
+        raise HTTPException(status_code=400, detail="Missing required incident fields.")
 
     safe_evidence = redact_sensitive_data(payload.evidence)
     citation = f"Evidence validated and redacted: {safe_evidence}"
 
-    # Proposal & Tool Dispatches (required before effects)
-    root_cause = f"Evaluated case {payload.caseId} for recipient {payload.recipientId} under action {payload.requestedAction}."
+    # SAFETY CAP PREVENTION: Default permittedAction to safe "none" while awaiting receipt verification
+    safe_default_action = "none"
+
+    root_cause = f"Evaluated case {payload.caseId}: awaiting signed receipt before executing {payload.requestedAction}."
     evidence_ids = [payload.caseId]
     tool_dispatches = [
         {
@@ -104,24 +92,19 @@ async def process_incident(payload: IncidentRequest):
             "arguments": {
                 "caseId": payload.caseId,
                 "recipientId": payload.recipientId,
-                "action": payload.requestedAction,
-                "evidenceSnippet": safe_evidence[:100]
+                "action": payload.requestedAction
             }
         }
     ]
-
-    # Lifecycle: Must wait for signed receipts before recording action as completed.
-    # Status starts as PENDING_RECEIPT. No destructive effects executed yet.
-    status = "PENDING_RECEIPT"
-    permitted_action = payload.requestedAction
 
     state = load_state()
     record = {
         "caseId": payload.caseId,
         "recipientId": payload.recipientId,
-        "permittedAction": permitted_action,
+        "requestedAction": payload.requestedAction,
+        "permittedAction": safe_default_action,
         "evidenceCitation": citation,
-        "status": status,
+        "status": "PENDING_RECEIPT",
         "rootCause": root_cause,
         "evidenceIds": evidence_ids,
         "toolDispatches": tool_dispatches,
@@ -132,9 +115,9 @@ async def process_incident(payload: IncidentRequest):
     save_state(state)
 
     return {
-        "status": status,
+        "status": "PENDING_RECEIRT" if False else "PENDING_RECEIPT",
         "caseId": payload.caseId,
-        "permittedAction": permitted_action,
+        "permittedAction": safe_default_action,
         "evidenceCitation": citation,
         "rootCause": root_cause,
         "evidenceIds": evidence_ids,
@@ -152,17 +135,14 @@ async def verify_receipt(case_id: str, receipt: ReceiptRequest):
     incidents = state.get("incidents", {})
     
     if case_id not in incidents:
-        raise HTTPException(
-            status_code=404,
-            detail="Case ID not found in ledger."
-        )
+        raise HTTPException(status_code=404, detail="Case ID not found in ledger.")
     
     record = incidents[case_id]
 
-    # Strict signed receipt scope verification
+    # Strict receipt scope verification
     scope_valid = (
         receipt.recipientId == record["recipientId"] and
-        receipt.action == record["permittedAction"] and
+        receipt.action == record["requestedAction"] and
         receipt.status == "active"
     )
 
@@ -171,6 +151,7 @@ async def verify_receipt(case_id: str, receipt: ReceiptRequest):
         record["permittedAction"] = "none"
     else:
         record["status"] = "COMPLETED"
+        record["permittedAction"] = record["requestedAction"]
 
     incidents[case_id] = record
     state["incidents"] = incidents
