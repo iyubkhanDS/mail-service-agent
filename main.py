@@ -2,12 +2,12 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Mailroom Incident Agent", version="3.0.0")
+app = FastAPI(title="Mailroom Incident Agent", version="3.1.0")
 STATE_FILE = "incident_state.json"
 
 def load_state() -> Dict[str, Any]:
@@ -25,21 +25,25 @@ class IncidentRequest(BaseModel):
     recipientId: str = Field(..., alias="recipientId")
     requestedAction: str = Field(..., alias="requestedAction")
     evidence: str = Field(..., alias="evidence")
+    receipt: Optional[Dict[str, Any]] = Field(default=None, alias="receipt")
     class Config:
         populate_by_name = True
 
 class ReceiptRequest(BaseModel):
     recipientId: str = Field(..., alias="recipientId")
     action: str = Field(..., alias="action")
+    status: Optional[str] = Field(default="active", alias="status")
     timestamp: str = Field(..., alias="timestamp")
-    signature: str = Field(..., alias="signature")
+    signature: Optional[str] = Field(default="", alias="signature")
     class Config:
         populate_by_name = True
 
 def redact_sensitive_data(text: str) -> str:
     if not text:
         return "[REDACTED]"
-    return re.sub(r'(sk-[a-zA-Z0-9]{20,}|password|secret|token|key|confidential)', '[REDACTED]', text, flags=re.IGNORECASE)
+    # Comprehensive redaction for API keys, passwords, secrets, tokens, and PII patterns
+    pattern = r'(sk-[a-zA-Z0-9]{20,}|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
+    return re.sub(pattern, '[REDACTED]', text, flags=re.IGNORECASE)
 
 @app.middleware("http")
 async def add_correlation_and_tracing(request: Request, call_next):
@@ -71,17 +75,36 @@ async def process_incident(payload: IncidentRequest):
     safe_evidence = redact_sensitive_data(payload.evidence)
     citation = f"Evidence validated and redacted: {safe_evidence}"
 
+    # Validate receipt scope if included in the initial request
+    scope_valid = True
+    if payload.receipt:
+        r_recipient = payload.receipt.get("recipientId", payload.receipt.get("recipient", ""))
+        r_action = payload.receipt.get("action", "")
+        r_status = payload.receipt.get("status", "active")
+        if r_recipient != payload.recipientId or r_action != payload.requestedAction or r_status != "active":
+            scope_valid = False
+    else:
+        scope_valid = False # Require valid receipt before executing destructive/permitted actions
+
+    # SAFETY CAP: If scope is invalid, force safe fallback action ("none") to prevent destructive effects
+    if scope_valid:
+        action_taken = payload.requestedAction
+        status = "COMPLETED"
+    else:
+        action_taken = "none"
+        status = "REJECTED_SCOPE_MISMATCH"
+
     state = load_state()
     
     record = {
         "caseId": payload.caseId,
         "recipientId": payload.recipientId,
-        "permittedAction": payload.requestedAction,
+        "permittedAction": action_taken,
         "evidenceCitation": citation,
-        "status": "PENDING_RECEIPT",
-        "rootCause": "Verified case payload analysis",
+        "status": status,
+        "rootCause": "Verified case payload analysis and receipt scope validation",
         "evidenceIds": [payload.caseId],
-        "toolDispatches": [{"tool": "validate_evidence", "arguments": {"evidence": safe_evidence}}],
+        "toolDispatches": [{"tool": "validate_evidence_and_scope", "arguments": {"evidence": safe_evidence}}],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
     
@@ -89,9 +112,9 @@ async def process_incident(payload: IncidentRequest):
     save_state(state)
 
     return {
-        "status": "PENDING_RECEIPT",
+        "status": status,
         "caseId": payload.caseId,
-        "permittedAction": payload.requestedAction,
+        "permittedAction": action_taken,
         "evidenceCitation": citation,
         "rootCause": record["rootCause"],
         "evidenceIds": record["evidenceIds"],
@@ -116,25 +139,25 @@ async def verify_receipt(case_id: str, receipt: ReceiptRequest):
     
     record = incidents[case_id]
 
-    if receipt.recipientId != record["recipientId"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Scope mismatch: Recipient ID does not match case file."
-        )
+    # Strict receipt scope validation
+    scope_valid = (
+        receipt.recipientId == record["recipientId"] and
+        receipt.action == record["permittedAction"] and
+        receipt.status == "active"
+    )
 
-    if receipt.action != record["permittedAction"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Scope mismatch: Action does not match permitted action."
-        )
+    if not scope_valid:
+        record["status"] = "REJECTED_SCOPE_MISMATCH"
+        record["permittedAction"] = "none"
+    else:
+        record["status"] = "COMPLETED"
 
-    record["status"] = "COMPLETED"
     incidents[case_id] = record
     state["incidents"] = incidents
     save_state(state)
 
     return {
-        "status": "COMPLETED",
+        "status": record["status"],
         "caseId": case_id,
         "recipientId": record["recipientId"],
         "actionTaken": record["permittedAction"],
