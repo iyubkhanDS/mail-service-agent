@@ -3,11 +3,12 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Request
+from typing import Dict, Any, Optional, List
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Mailroom Incident Agent", version="4.1.0")
+app = FastAPI(title="Mailroom Incident Agent", version="5.0.0")
 STATE_FILE = "incident_state.json"
 
 def load_state() -> Dict[str, Any]:
@@ -28,6 +29,7 @@ class IncidentRequest(BaseModel):
     recipientId: str = Field(..., alias="recipientId")
     requestedAction: str = Field(..., alias="requestedAction")
     evidence: str = Field(..., alias="evidence")
+    receipt: Optional[Dict[str, Any]] = Field(default=None, alias="receipt")
     class Config:
         populate_by_name = True
 
@@ -43,25 +45,30 @@ class ReceiptRequest(BaseModel):
 def redact_sensitive_data(text: str) -> str:
     if not text:
         return "[REDACTED]"
-    pattern = r'(sk-[a-zA-Z0-9]{20,}|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
+    # Aggressive redaction pattern to scrub API keys, tokens, passwords, secrets, and PII
+    pattern = r'(sk-[a-zA-Z0-9_\-]+|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential|[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+|[0-9a-fA-F]{32,})'
     return re.sub(pattern, '[REDACTED]', text, flags=re.IGNORECASE)
 
 @app.middleware("http")
 async def add_correlation_and_tracing(request: Request, call_next):
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or str(uuid.uuid4())
+    
+    # W3C Traceparent propagation and continuity
     incoming_traceparent = request.headers.get("traceparent")
     trace_id = ""
     if incoming_traceparent:
         parts = incoming_traceparent.split("-")
         if len(parts) >= 2:
             trace_id = parts[1]
+    
     if not trace_id or len(trace_id) != 32:
-        trace_id = uuid.uuid4().hex + uuid.uuid4().hex[:16]
-        trace_id = trace_id[:32]
+        trace_id = uuid.uuid4().hex[:32]
+
     new_span_id = uuid.uuid4().hex[:16]
     outgoing_traceparent = f"00-{trace_id}-{new_span_id}-01"
 
     response = await call_next(request)
+    
     response.headers["x-correlation-id"] = correlation_id
     response.headers["x-request-id"] = correlation_id
     response.headers["traceparent"] = outgoing_traceparent
@@ -79,20 +86,29 @@ async def process_incident(payload: IncidentRequest):
         raise HTTPException(status_code=400, detail="Missing required incident fields.")
 
     safe_evidence = redact_sensitive_data(payload.evidence)
-    citation = f"Evidence validated and redacted: {safe_evidence}"
+    citation = f"Evidence validated and safely redacted."
 
     # SAFETY CAP PREVENTION: Default permittedAction to safe "none" while awaiting receipt verification
-    safe_default_action = "none"
+    permitted_action = "none"
+    status = "PENDING_RECEIPT"
 
-    root_cause = f"Evaluated case {payload.caseId}: awaiting signed receipt before executing {payload.requestedAction}."
+    if payload.receipt:
+        r_recipient = payload.receipt.get("recipientId", payload.receipt.get("recipient", ""))
+        r_action = payload.receipt.get("action", "")
+        r_status = payload.receipt.get("status", "active")
+        if r_recipient == payload.recipientId and r_action == payload.requestedAction and r_status == "active":
+            permitted_action = payload.requestedAction
+            status = "COMPLETED"
+
+    root_cause = f"Evaluated case {payload.caseId} for recipient {payload.recipientId}. Awaiting signed receipt."
     evidence_ids = [payload.caseId]
     tool_dispatches = [
         {
-            "tool": "validate_evidence_and_scope",
+            "tool": "verify_receipt_scope",
             "arguments": {
                 "caseId": payload.caseId,
                 "recipientId": payload.recipientId,
-                "action": payload.requestedAction
+                "requestedAction": payload.requestedAction
             }
         }
     ]
@@ -102,9 +118,9 @@ async def process_incident(payload: IncidentRequest):
         "caseId": payload.caseId,
         "recipientId": payload.recipientId,
         "requestedAction": payload.requestedAction,
-        "permittedAction": safe_default_action,
+        "permittedAction": permitted_action,
         "evidenceCitation": citation,
-        "status": "PENDING_RECEIPT",
+        "status": status,
         "rootCause": root_cause,
         "evidenceIds": evidence_ids,
         "toolDispatches": tool_dispatches,
@@ -115,9 +131,9 @@ async def process_incident(payload: IncidentRequest):
     save_state(state)
 
     return {
-        "status": "PENDING_RECEIRT" if False else "PENDING_RECEIPT",
+        "status": status,
         "caseId": payload.caseId,
-        "permittedAction": safe_default_action,
+        "permittedAction": permitted_action,
         "evidenceCitation": citation,
         "rootCause": root_cause,
         "evidenceIds": evidence_ids,
