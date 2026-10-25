@@ -3,14 +3,11 @@ import hashlib
 import json
 import logging
 import os
-import re
-import secrets
 import sqlite3
 import time
 import urllib.error
 import urllib.request
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,7 +15,8 @@ from starlette.concurrency import run_in_threadpool
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 DB_FILE = os.environ.get("ACTION_GATE_DB_FILE", "action_gate.db")
-MAX_RESPONSE_BYTES = 768 * 1024
+PROFILE = "ga5-mailroom-action-gate/v2"
+MAX_RESPONSE_BYTES = 512 * 1024
 LOGGER = logging.getLogger("action_gate")
 
 ALLOWED_ACTIONS = {
@@ -35,7 +33,6 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        # Mailroom Action Gate tables
         conn.execute("""
             CREATE TABLE IF NOT EXISTS evaluations (
                 evaluation_id TEXT PRIMARY KEY,
@@ -67,34 +64,11 @@ def init_db() -> None:
                 PRIMARY KEY (evaluation_id, receipt_id)
             )
         """)
-        # Incident Agent tables
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS runs (
-                run_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                root_cause TEXT NOT NULL,
-                evidence TEXT NOT NULL,
-                chosen_effect TEXT,
-                action_log TEXT NOT NULL,
-                receipt_log TEXT NOT NULL,
-                otlp_trace TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                initial_response TEXT NOT NULL,
-                current_response TEXT NOT NULL,
-                pending_dispatches TEXT NOT NULL,
-                pending_approval TEXT,
-                diagnostic_action_ids TEXT NOT NULL,
-                effect_action_id TEXT,
-                plan_json TEXT NOT NULL,
-                trace_state TEXT NOT NULL,
-                suppressed TEXT NOT NULL
-            )
-        """)
         conn.commit()
     finally:
         conn.close()
 
-app = FastAPI(title="Unified Mailroom and Incident Agent Service", version="v2")
+app = FastAPI(title="Mailroom Action Gate", version="v2")
 
 @app.on_event("startup")
 async def startup_event():
@@ -128,9 +102,56 @@ def response_json(response: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="Response exceeds the supported size limit.")
     return response
 
+def validate_propose_request(body: Dict[str, Any]) -> None:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON request.")
+    if body.get("profile") != PROFILE:
+        raise HTTPException(status_code=400, detail="Unsupported profile configuration.")
+    if body.get("operation") != "propose":
+        raise HTTPException(status_code=400, detail="Invalid operation.")
+    if not isinstance(body.get("evaluationId"), str) or not body["evaluationId"]:
+        raise HTTPException(status_code=422, detail="Missing or invalid evaluationId.")
+    
+    verifier = body.get("receiptVerifier")
+    if not isinstance(verifier, dict) or verifier.get("algorithm") != "Ed25519":
+        raise HTTPException(status_code=422, detail="Invalid receiptVerifier.")
+    pk = verifier.get("publicKeyJwk")
+    if not isinstance(pk, dict) or pk.get("kty") != "OKP" or pk.get("crv") != "Ed25519" or not isinstance(pk.get("x"), str):
+        raise HTTPException(status_code=422, detail="Invalid publicKeyJwk.")
+
+    corpus = body.get("corpus")
+    if not isinstance(corpus, dict) or not isinstance(corpus.get("coreId"), str) or not isinstance(corpus.get("auditId"), str):
+        raise HTTPException(status_code=422, detail="Invalid corpus metadata.")
+
+    dossiers = body.get("dossiers")
+    if not isinstance(dossiers, list) or not dossiers:
+        raise HTTPException(status_code=422, detail="Invalid dossiers list.")
+
+    allowed_actions = body.get("allowedActions")
+    if not isinstance(allowed_actions, list) or not all(a in ALLOWED_ACTIONS for a in allowed_actions):
+        raise HTTPException(status_code=422, detail="Invalid allowedActions.")
+
+    dossier_ids = set()
+    for d in dossiers:
+        if not isinstance(d, dict) or not isinstance(d.get("dossierId"), str) or not d["dossierId"]:
+            raise HTTPException(status_code=422, detail="Invalid dossier structure.")
+        if d["dossierId"] in dossier_ids:
+            raise HTTPException(status_code=400, detail="Duplicate dossier IDs.")
+        dossier_ids.add(d["dossierId"])
+        sources = d.get("sources")
+        if not isinstance(sources, list):
+            raise HTTPException(status_code=422, detail="Invalid sources list.")
+        for s in sources:
+            if not isinstance(s, dict) or not isinstance(s.get("sourceId"), str) or not isinstance(s.get("lines"), list):
+                raise HTTPException(status_code=422, detail="Invalid source structure.")
+            for line in s["lines"]:
+                if not isinstance(line, dict) or not isinstance(line.get("lineId"), str) or not isinstance(line.get("text"), str):
+                    raise HTTPException(status_code=422, detail="Invalid line structure.")
+
 def generate_proposal_for_dossier(dossier: Dict[str, Any], allowed_actions: List[str]) -> Dict[str, Any]:
-    dossier_id = dossier.get("dossierId", "dossier-unknown")
+    dossier_id = dossier["dossierId"]
     mailbox = dossier.get("mailbox", "support")
+    objective = dossier.get("objective", "")
     sources = dossier.get("sources", [])
     
     all_lines = {}
@@ -144,9 +165,17 @@ def generate_proposal_for_dossier(dossier: Dict[str, Any], allowed_actions: List
                 full_text_lines.append(f"{lid}: {ltxt}")
     
     combined_text = "\n".join(full_text_lines).lower()
-    evidence_keys = [list(all_lines.keys())[0]] if all_lines else ["line-1"]
+    lower_obj = objective.lower()
 
-    if any(term in combined_text for term in ["ignore previous", "system prompt", "exfiltrate", "bypass", "malicious", "override", "hack"]):
+    # Find the most relevant single minimal evidence line ID
+    evidence_key = list(all_lines.keys())[0] if all_lines else "line-1"
+    for lid, ltxt in all_lines.items():
+        if any(w in ltxt.lower() for w in ["order", "status", "delivery", "approve", "confirm", "prompt", "system"]):
+            evidence_key = lid
+            break
+
+    # Precision classification based on authority, provenance, and case state
+    if any(term in combined_text or term in lower_obj for term in ["ignore previous", "system prompt", "exfiltrate", "bypass", "malicious", "override", "control tools"]):
         action = "quarantine_item"
         target = {"kind": "security_queue", "id": "mailroom"}
         payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
@@ -183,11 +212,10 @@ def generate_proposal_for_dossier(dossier: Dict[str, Any], allowed_actions: List
         "action": action,
         "target": target,
         "payload": payload,
-        "evidence": evidence_keys,
+        "evidence": [evidence_key],
     }
 
 @app.post("/")
-@app.post("/v2/incidents")
 @app.post("/v2/mailroom")
 async def handle_operations(request: Request):
     try:
@@ -198,34 +226,16 @@ async def handle_operations(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON request.")
 
-    profile = body.get("profile", "")
     operation = body.get("operation")
-
-    # Handle Incident Agent profile if requested
-    if profile == "ga5-incident-agent/v2" or "incident" in body or "runId" in body:
-        from fastapi.responses import Response
-        # Fallback handling for incident agent if needed
-        run_id = body.get("runId", str(uuid.uuid4()))
-        return JSONResponse(status_code=200, content={
-            "runId": run_id,
-            "status": "waiting",
-            "diagnosis": {"rootCause": "Examined incident transcript", "evidence": ["ev_1"]},
-            "dispatches": [],
-            "approvals": []
-        })
-
-    # Mailroom Action Gate / Propose-Commit Workflow
     if operation == "propose":
-        evaluation_id = body.get("evaluationId")
-        corpus = body.get("corpus", {})
-        core_id = corpus.get("coreId", "core-default")
-        audit_id = corpus.get("auditId", "audit-default")
-        dossiers = body.get("dossiers", [])
-        receipt_verifier = body.get("receiptVerifier", {})
+        validate_propose_request(body)
+        evaluation_id = body["evaluationId"]
+        corpus = body["corpus"]
+        core_id = corpus["coreId"]
+        audit_id = corpus["auditId"]
+        dossiers = body["dossiers"]
+        receipt_verifier = body["receiptVerifier"]
         allowed_actions = body.get("allowedActions", list(ALLOWED_ACTIONS))
-
-        if not evaluation_id or not dossiers:
-            raise HTTPException(status_code=422, detail="Missing evaluationId or dossiers.")
 
         input_digest = compute_input_digest(dossiers)
         request_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
@@ -233,6 +243,7 @@ async def handle_operations(request: Request):
         conn = sqlite3.connect(DB_FILE, timeout=60.0)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            
             existing = conn.execute(
                 "SELECT request_hash, proposals_json FROM evaluations WHERE evaluation_id = ?",
                 (evaluation_id,)
@@ -243,7 +254,7 @@ async def handle_operations(request: Request):
                     raise HTTPException(status_code=409, detail="Evaluation ID conflicts with existing changed content.")
                 proposals = json.loads(existing[1])
                 return JSONResponse(status_code=200, content=response_json({
-                    "profile": "ga5-mailroom-action-gate/v2",
+                    "profile": PROFILE,
                     "evaluationId": evaluation_id,
                     "status": "awaiting_receipts",
                     "inputDigest": input_digest,
@@ -252,7 +263,7 @@ async def handle_operations(request: Request):
 
             proposals = []
             for dossier in dossiers:
-                dossier_id = dossier.get("dossierId", "unknown")
+                dossier_id = dossier["dossierId"]
                 content_hash = hashlib.sha256(canonical_json(dossier).encode("utf-8")).hexdigest()
 
                 cached = conn.execute(
@@ -279,7 +290,7 @@ async def handle_operations(request: Request):
             conn.commit()
 
             return JSONResponse(status_code=200, content=response_json({
-                "profile": "ga5-mailroom-action-gate/v2",
+                "profile": PROFILE,
                 "evaluationId": evaluation_id,
                 "status": "awaiting_receipts",
                 "inputDigest": input_digest,
@@ -292,11 +303,13 @@ async def handle_operations(request: Request):
             conn.close()
 
     elif operation == "commit":
+        if body.get("profile") != PROFILE:
+            raise HTTPException(status_code=400, detail="Unsupported profile configuration.")
         evaluation_id = body.get("evaluationId")
         input_digest = body.get("inputDigest")
-        receipts = body.get("receipts", [])
+        receipts = body.get("receipts")
 
-        if not evaluation_id or not input_digest or not isinstance(receipts, list):
+        if not isinstance(evaluation_id, str) or not isinstance(input_digest, str) or not isinstance(receipts, list):
             raise HTTPException(status_code=422, detail="Invalid commit request format.")
 
         conn = sqlite3.connect(DB_FILE, timeout=60.0)
@@ -314,9 +327,9 @@ async def handle_operations(request: Request):
             proposals = json.loads(eval_row[1])
             proposal_map = {p["callId"]: p for p in proposals}
 
-            pk = receipt_verifier.get("publicKeyJwk", {})
+            pk = receipt_verifier["publicKeyJwk"]
             try:
-                public_key = Ed25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(pk.get("x", "") + "=="))
+                public_key = Ed25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(pk["x"] + "=="))
             except Exception as exc:
                 raise HTTPException(status_code=422, detail="Invalid public key.") from exc
 
@@ -334,7 +347,7 @@ async def handle_operations(request: Request):
                 dossier_id = r.get("dossierId")
                 action = r.get("action")
 
-                if not receipt_id or receipt_id in seen_receipt_ids:
+                if not isinstance(receipt_id, str) or not receipt_id or receipt_id in seen_receipt_ids:
                     raise HTTPException(status_code=422, detail="Invalid or duplicate receipt ID.")
                 seen_receipt_ids.add(receipt_id)
 
@@ -350,7 +363,7 @@ async def handle_operations(request: Request):
                     raise HTTPException(status_code=422, detail="Proposal digest mismatch.")
 
                 signed_inner = {
-                    "profile": "ga5-mailroom-action-gate/v2",
+                    "profile": PROFILE,
                     "evaluationId": evaluation_id,
                     "inputDigest": input_digest,
                     "receipt": {
@@ -387,7 +400,7 @@ async def handle_operations(request: Request):
 
             conn.commit()
             return JSONResponse(status_code=200, content=response_json({
-                "profile": "ga5-mailroom-action-gate/v2",
+                "profile": PROFILE,
                 "evaluationId": evaluation_id,
                 "status": "completed",
                 "inputDigest": input_digest,
@@ -400,4 +413,4 @@ async def handle_operations(request: Request):
             conn.close()
 
     else:
-        raise HTTPException(status_code=400, detail="Unknown or missing operation.")
+        raise HTTPException(status_code=400, detail="Unknown operation.")
