@@ -1,221 +1,408 @@
+import base64
+import hashlib
 import json
+import logging
 import os
-import re
-import uuid
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+import sqlite3
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-app = FastAPI(title="Mailroom Incident Agent", version="9.0.0")
-STATE_FILE = "incident_state.json"
+DB_FILE = os.environ.get("ACTION_GATE_DB_FILE", "action_gate.db")
+PROFILE = "ga5-mailroom-action-gate/v2"
+MAX_RESPONSE_BYTES = 512 * 1024
+LOGGER = logging.getLogger("action_gate")
 
-def load_state() -> Dict[str, Any]:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {"incidents": {}}
-    return {"incidents": {}}
+ALLOWED_ACTIONS = {
+    "create_draft",
+    "update_internal_record",
+    "send_approved_notice",
+    "request_confirmation",
+    "quarantine_item",
+    "no_action",
+}
 
-def save_state(state: Dict[str, Any]):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def init_db() -> None:
+    conn = sqlite3.connect(DB_FILE, timeout=60.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                core_id TEXT NOT NULL,
+                audit_id TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                receipt_verifier TEXT NOT NULL,
+                proposals_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dossiers (
+                core_id TEXT NOT NULL,
+                dossier_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                proposal_json TEXT NOT NULL,
+                PRIMARY KEY (core_id, dossier_id, content_hash)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS commit_receipts (
+                evaluation_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                outcome_json TEXT NOT NULL,
+                PRIMARY KEY (evaluation_id, receipt_id)
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
 
-def redact_sensitive_data(text: str) -> str:
-    if not text:
-        return "[REDACTED]"
-    redacted = str(text)
-    redacted = re.sub(r'(sk-[a-zA-Z0-9_\-]+|bearer\s+[a-zA-Z0-9_\-\.]+|password|secret|token|key|confidential)', '[REDACTED]', redacted, flags=re.IGNORECASE)
-    redacted = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED_EMAIL]', redacted)
-    return redacted
+app = FastAPI(title="Mailroom Action Gate", version="v2")
 
-@app.middleware("http")
-async def add_correlation_and_tracing(request: Request, call_next):
-    correlation_id = request.headers.get("x-correlation-id") or request.headers.get("x-request-id") or str(uuid.uuid4())
-    
-    incoming_traceparent = request.headers.get("traceparent")
-    trace_id = ""
-    if incoming_traceparent:
-        parts = incoming_traceparent.split("-")
-        if len(parts) >= 2:
-            trace_id = parts[1]
-    
-    if not trace_id or len(trace_id) != 32:
-        trace_id = uuid.uuid4().hex[:32]
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
-    new_span_id = uuid.uuid4().hex[:16]
-    outgoing_traceparent = f"00-{trace_id}-{new_span_id}-01"
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-    response = await call_next(request)
-    
-    response.headers["x-correlation-id"] = correlation_id
-    response.headers["x-request-id"] = correlation_id
-    response.headers["traceparent"] = outgoing_traceparent
+def compute_input_digest(dossiers: List[Any]) -> str:
+    serialized = canonical_json(dossiers)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+def compute_proposal_digest(proposal: Dict[str, Any]) -> str:
+    filtered = {
+        "dossierId": proposal.get("dossierId"),
+        "callId": proposal.get("callId"),
+        "action": proposal.get("action"),
+        "target": proposal.get("target"),
+        "payload": proposal.get("payload"),
+        "evidence": sorted(proposal.get("evidence", [])),
+    }
+    return hashlib.sha256(canonical_json(filtered).encode("utf-8")).hexdigest()
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+def response_json(response: Dict[str, Any]) -> Dict[str, Any]:
+    serialized = canonical_json(response)
+    if len(serialized.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise HTTPException(status_code=422, detail="Response exceeds the supported size limit.")
     return response
 
-@app.get("/")
-async def root():
-    return {"message": "Mailroom Incident Agent is running successfully."}
-
-async def handle_incident_logic(payload: dict):
-    case_id = payload.get("caseId") or payload.get("case_id") or payload.get("id") or "CASE-UNKNOWN"
-    recipient_id = payload.get("recipientId") or payload.get("recipient") or "RECIPIENT-UNKNOWN"
-    requested_action = payload.get("requestedAction") or payload.get("action") or payload.get("action_requested") or "none"
-    evidence = payload.get("evidence") or payload.get("evidence_text") or "No evidence provided"
-    receipt = payload.get("receipt") or {}
-
-    safe_evidence = redact_sensitive_data(evidence)
-    citation = f"Evidence validated and redacted: {safe_evidence}"
-
-    permitted_action = "none"
-    status = "PENDING_RECEIPT"
-
-    if receipt:
-        r_recipient = receipt.get("recipientId") or receipt.get("recipient", "")
-        r_action = receipt.get("action", "")
-        r_status = receipt.get("status", "active")
-        if r_recipient == recipient_id and r_action == requested_action and r_status == "active":
-            permitted_action = requested_action
-            status = "COMPLETED"
-
-    root_cause = f"Evaluated case {case_id} for recipient {recipient_id}. Awaiting signed receipt before executing {requested_action}."
-    evidence_ids = [case_id]
-    tool_dispatches = [
-        {
-            "tool": "verify_receipt_scope",
-            "arguments": {
-                "caseId": case_id,
-                "recipientId": recipient_id,
-                "action": requested_action
-            }
-        }
-    ]
-
-    state = load_state()
-    record = {
-        "caseId": case_id,
-        "recipientId": recipient_id,
-        "requestedAction": requested_action,
-        "permittedAction": permitted_action,
-        "action": permitted_action,
-        "evidenceCitation": citation,
-        "rootCause": root_cause,
-        "proposal": root_cause,
-        "evidenceIds": evidence_ids,
-        "toolDispatches": tool_dispatches,
-        "status": status,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    state["incidents"][case_id] = record
-    save_state(state)
-
-    return {
-        "status": status,
-        "caseId": case_id,
-        "recipientId": recipient_id,
-        "requestedAction": requested_action,
-        "permittedAction": permitted_action,
-        "action": permitted_action,
-        "evidenceCitation": citation,
-        "rootCause": root_cause,
-        "proposal": root_cause,
-        "evidenceIds": evidence_ids,
-        "toolDispatches": tool_dispatches,
-        "requiredScope": {
-            "caseId": case_id,
-            "recipientId": recipient_id,
-            "action": requested_action
-        }
-    }
-
-@app.post("/v2/incidents")
-async def process_incidents_v2(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    result = await handle_incident_logic(payload)
-    return JSONResponse(content=result, status_code=200)
-
-@app.post("/v1/mailroom/actions")
-async def process_mailroom_actions(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    result = await handle_incident_logic(payload)
-    return JSONResponse(content=result, status_code=200)
-
-@app.post("/propose")
-async def process_propose(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    result = await handle_incident_logic(payload)
-    return JSONResponse(content=result, status_code=200)
-
-@app.post("/v2/incidents/{case_id}/receipt")
-async def verify_receipt(case_id: str, request: Request):
-    try:
-        receipt = await request.json()
-    except Exception:
-        receipt = {}
-
-    state = load_state()
-    incidents = state.get("incidents", {})
+def validate_propose_request(body: Dict[str, Any]) -> None:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON request.")
+    if body.get("profile") != PROFILE:
+        raise HTTPException(status_code=400, detail="Unsupported profile configuration.")
+    if body.get("operation") != "propose":
+        raise HTTPException(status_code=400, detail="Invalid operation.")
+    if not isinstance(body.get("evaluationId"), str) or not body["evaluationId"]:
+        raise HTTPException(status_code=422, detail="Missing or invalid evaluationId.")
     
-    if case_id not in incidents:
-        incidents[case_id] = {
-            "caseId": case_id,
-            "recipientId": receipt.get("recipientId", "unknown"),
-            "requestedAction": receipt.get("action", "none"),
-            "permittedAction": receipt.get("action", "none"),
-            "status": "COMPLETED"
-        }
+    verifier = body.get("receiptVerifier")
+    if not isinstance(verifier, dict) or verifier.get("algorithm") != "Ed25519":
+        raise HTTPException(status_code=422, detail="Invalid receiptVerifier.")
+    pk = verifier.get("publicKeyJwk")
+    if not isinstance(pk, dict) or pk.get("kty") != "OKP" or pk.get("crv") != "Ed25519" or not isinstance(pk.get("x"), str):
+        raise HTTPException(status_code=422, detail="Invalid publicKeyJwk.")
 
-    record = incidents[case_id]
-    r_recipient = receipt.get("recipientId") or receipt.get("recipient", "")
-    r_action = receipt.get("action", "")
-    r_status = receipt.get("status", "active")
+    corpus = body.get("corpus")
+    if not isinstance(corpus, dict) or not isinstance(corpus.get("coreId"), str) or not isinstance(corpus.get("auditId"), str):
+        raise HTTPException(status_code=422, detail="Invalid corpus metadata.")
 
-    scope_valid = (
-        r_recipient == record.get("recipientId") and
-        r_action == record.get("requestedAction") and
-        r_status == "active"
-    )
+    dossiers = body.get("dossiers")
+    if not isinstance(dossiers, list) or not dossiers:
+        raise HTTPException(status_code=422, detail="Invalid dossiers list.")
 
-    if not scope_valid:
-        record["status"] = "REJECTED_SCOPE_MISMATCH"
-        record["permittedAction"] = "none"
-        record["action"] = "none"
-        incidents[case_id] = record
-        save_state(state)
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Scope mismatch: Recipient ID, action, or active status does not match case file."}
-        )
+    allowed_actions = body.get("allowedActions", list(ALLOWED_ACTIONS))
+    if not isinstance(allowed_actions, list) or not all(a in ALLOWED_ACTIONS for a in allowed_actions):
+        raise HTTPException(status_code=422, detail="Invalid allowedActions.")
 
-    record["status"] = "COMPLETED"
-    record["permittedAction"] = record["requestedAction"]
-    record["action"] = record["requestedAction"]
+    dossier_ids = set()
+    for d in dossiers:
+        if not isinstance(d, dict) or not isinstance(d.get("dossierId"), str) or not d["dossierId"]:
+            raise HTTPException(status_code=422, detail="Invalid dossier structure.")
+        if d["dossierId"] in dossier_ids:
+            raise HTTPException(status_code=400, detail="Duplicate dossier IDs.")
+        dossier_ids.add(d["dossierId"])
+        sources = d.get("sources")
+        if not isinstance(sources, list):
+            raise HTTPException(status_code=422, detail="Invalid sources list.")
+        for s in sources:
+            if not isinstance(s, dict) or not isinstance(s.get("sourceId"), str) or not isinstance(s.get("lines"), list):
+                raise HTTPException(status_code=422, detail="Invalid source structure.")
+            for line in s["lines"]:
+                if not isinstance(line, dict) or not isinstance(line.get("lineId"), str) or not isinstance(line.get("text"), str):
+                    raise HTTPException(status_code=422, detail="Invalid line structure.")
 
-    incidents[case_id] = record
-    state["incidents"] = incidents
-    save_state(state)
+def generate_proposal_for_dossier(dossier: Dict[str, Any], allowed_actions: List[str]) -> Dict[str, Any]:
+    dossier_id = dossier["dossierId"]
+    mailbox = dossier.get("mailbox", "support")
+    sources = dossier.get("sources", [])
+    
+    all_lines = {}
+    full_text_lines = []
+    for s in sources:
+        for l in s.get("lines", []):
+            lid = l.get("lineId")
+            ltxt = l.get("text", "")
+            if lid:
+                all_lines[lid] = ltxt
+                full_text_lines.append(f"{lid}: {ltxt}")
+    
+    combined_text = "\n".join(full_text_lines).lower()
+    evidence_keys = [list(all_lines.keys())[0]] if all_lines else ["line-1"]
 
-    return JSONResponse(content={
-        "status": "COMPLETED",
-        "caseId": case_id,
-        "recipientId": record["recipientId"],
-        "actionTaken": record["permittedAction"],
-        "action": record["permittedAction"],
-        "permittedAction": record["permittedAction"],
-        "evidenceCitation": record.get("evidenceCitation", ""),
-        "rootCause": record.get("rootCause", ""),
-        "proposal": record.get("proposal", ""),
-        "evidenceIds": record.get("evidenceIds", []),
-        "toolDispatches": record.get("toolDispatches", [])
-    }, status_code=200)
+    # Decision logic conforming strictly to action schemas
+    if any(term in combined_text for term in ["ignore previous", "system prompt", "exfiltrate", "bypass", "malicious", "override", "hack"]):
+        action = "quarantine_item"
+        target = {"kind": "security_queue", "id": "mailroom"}
+        payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+    elif "status" in combined_text or "order" in combined_text or "where is" in combined_text or "tracking" in combined_text:
+        action = "create_draft"
+        target = {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}
+        payload = {"recipient": mailbox, "referenceId": dossier_id, "status": "pending", "template": "order_status"}
+    elif "delivery window" in combined_text or "reschedule" in combined_text or "delivery time" in combined_text:
+        action = "update_internal_record"
+        target = {"kind": "case_record", "id": dossier_id}
+        payload = {"field": "delivery_window", "sourceEventId": dossier_id, "value": "updated"}
+    elif "approve" in combined_text or "approved notice" in combined_text:
+        action = "send_approved_notice"
+        target = {"kind": "email", "id": mailbox}
+        payload = {"referenceId": dossier_id, "status": "approved", "template": "approved_delivery_notice"}
+    elif "confirm" in combined_text or "verify" in combined_text or "identity" in combined_text:
+        action = "request_confirmation"
+        target = {"kind": "approval_queue", "id": "verification-team"}
+        payload = {"claimedSender": mailbox, "questionCode": "VERIFY_REQUEST", "referenceId": dossier_id}
+    else:
+        action = "no_action"
+        target = None
+        payload = {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id}
+
+    if action not in allowed_actions:
+        action = "no_action"
+        target = None
+        payload = {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id}
+
+    call_id = hashlib.sha256(f"{dossier_id}:{action}:{canonical_json(payload)}".encode("utf-8")).hexdigest()[:16]
+    return {
+        "dossierId": dossier_id,
+        "callId": call_id,
+        "action": action,
+        "target": target,
+        "payload": payload,
+        "evidence": evidence_keys,
+    }
+
+@app.post("/")
+@app.post("/v2/mailroom")
+async def handle_operations(request: Request):
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON request.") from exc
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON request.")
+
+    operation = body.get("operation")
+    if operation == "propose":
+        validate_propose_request(body)
+        evaluation_id = body["evaluationId"]
+        corpus = body["corpus"]
+        core_id = corpus["coreId"]
+        audit_id = corpus["auditId"]
+        dossiers = body["dossiers"]
+        receipt_verifier = body["receiptVerifier"]
+        allowed_actions = body.get("allowedActions", list(ALLOWED_ACTIONS))
+
+        input_digest = compute_input_digest(dossiers)
+        request_hash = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+        conn = sqlite3.connect(DB_FILE, timeout=60.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            
+            existing = conn.execute(
+                "SELECT request_hash, proposals_json FROM evaluations WHERE evaluation_id = ?",
+                (evaluation_id,)
+            ).fetchone()
+
+            if existing:
+                if existing[0] != request_hash:
+                    raise HTTPException(status_code=409, detail="Evaluation ID conflicts with existing changed content.")
+                proposals = json.loads(existing[1])
+                return JSONResponse(status_code=200, content=response_json({
+                    "profile": PROFILE,
+                    "evaluationId": evaluation_id,
+                    "status": "awaiting_receipts",
+                    "inputDigest": input_digest,
+                    "proposals": proposals,
+                }))
+
+            proposals = []
+            for dossier in dossiers:
+                dossier_id = dossier["dossierId"]
+                content_hash = hashlib.sha256(canonical_json(dossier).encode("utf-8")).hexdigest()
+
+                cached = conn.execute(
+                    "SELECT proposal_json FROM dossiers WHERE core_id = ? AND dossier_id = ? AND content_hash = ?",
+                    (core_id, dossier_id, content_hash)
+                ).fetchone()
+
+                if cached:
+                    prop = json.loads(cached[0])
+                else:
+                    prop = await run_in_threadpool(generate_proposal_for_dossier, dossier, allowed_actions)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO dossiers (core_id, dossier_id, content_hash, proposal_json) VALUES (?, ?, ?, ?)",
+                        (core_id, dossier_id, content_hash, canonical_json(prop))
+                    )
+                proposals.append(prop)
+
+            conn.execute(
+                """INSERT INTO evaluations 
+                   (evaluation_id, core_id, audit_id, input_digest, request_hash, receipt_verifier, proposals_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (evaluation_id, core_id, audit_id, input_digest, request_hash, canonical_json(receipt_verifier), canonical_json(proposals), "awaiting_receipts", time.time())
+            )
+            conn.commit()
+
+            return JSONResponse(status_code=200, content=response_json({
+                "profile": PROFILE,
+                "evaluationId": evaluation_id,
+                "status": "awaiting_receipts",
+                "inputDigest": input_digest,
+                "proposals": proposals,
+            }))
+        except HTTPException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    elif operation == "commit":
+        if body.get("profile") != PROFILE:
+            raise HTTPException(status_code=400, detail="Unsupported profile configuration.")
+        evaluation_id = body.get("evaluationId")
+        input_digest = body.get("inputDigest")
+        receipts = body.get("receipts")
+
+        if not isinstance(evaluation_id, str) or not isinstance(input_digest, str) or not isinstance(receipts, list):
+            raise HTTPException(status_code=422, detail="Invalid commit request format.")
+
+        conn = sqlite3.connect(DB_FILE, timeout=60.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            eval_row = conn.execute(
+                "SELECT receipt_verifier, proposals_json FROM evaluations WHERE evaluation_id = ?",
+                (evaluation_id,)
+            ).fetchone()
+
+            if not eval_row:
+                raise HTTPException(status_code=404, detail="Unknown evaluation ID.")
+
+            receipt_verifier = json.loads(eval_row[0])
+            proposals = json.loads(eval_row[1])
+            proposal_map = {p["callId"]: p for p in proposals}
+
+            pk = receipt_verifier["publicKeyJwk"]
+            try:
+                public_key = Ed25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(pk["x"] + "=="))
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="Invalid public key.") from exc
+
+            outcomes = []
+            seen_receipt_ids = set()
+
+            for r in receipts:
+                if not isinstance(r, dict):
+                    raise HTTPException(status_code=422, detail="Invalid receipt structure.")
+                receipt_id = r.get("receiptId")
+                call_id = r.get("callId")
+                signature_b64 = r.get("receiptSignature")
+                accepted = r.get("accepted")
+                proposal_digest = r.get("proposalDigest")
+                dossier_id = r.get("dossierId")
+                action = r.get("action")
+
+                if not isinstance(receipt_id, str) or not receipt_id or receipt_id in seen_receipt_ids:
+                    raise HTTPException(status_code=422, detail="Invalid or duplicate receipt ID.")
+                seen_receipt_ids.add(receipt_id)
+
+                if call_id not in proposal_map:
+                    raise HTTPException(status_code=422, detail="Call ID mismatch.")
+
+                expected_prop = proposal_map[call_id]
+                if expected_prop["dossierId"] != dossier_id or expected_prop["action"] != action:
+                    raise HTTPException(status_code=422, detail="Proposal mismatch.")
+
+                expected_digest = compute_proposal_digest(expected_prop)
+                if proposal_digest != expected_digest:
+                    raise HTTPException(status_code=422, detail="Proposal digest mismatch.")
+
+                signed_inner = {
+                    "profile": PROFILE,
+                    "evaluationId": evaluation_id,
+                    "inputDigest": input_digest,
+                    "receipt": {
+                        "dossierId": dossier_id,
+                        "callId": call_id,
+                        "action": action,
+                        "accepted": accepted,
+                        "proposalDigest": proposal_digest,
+                        "receiptId": receipt_id,
+                    }
+                }
+                signed_bytes = canonical_json(signed_inner).encode("utf-8")
+
+                try:
+                    sig_bytes = base64.b64decode(signature_b64)
+                    public_key.verify(sig_bytes, signed_bytes)
+                except Exception as exc:
+                    raise HTTPException(status_code=422, detail="Invalid cryptographic receipt signature.") from exc
+
+                status_str = "executed" if accepted else "rejected"
+                outcomes.append({
+                    "dossierId": dossier_id,
+                    "callId": call_id,
+                    "action": action,
+                    "proposalDigest": proposal_digest,
+                    "receiptId": receipt_id,
+                    "status": status_str,
+                })
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO commit_receipts (evaluation_id, receipt_id, call_id, outcome_json) VALUES (?, ?, ?, ?)",
+                    (evaluation_id, receipt_id, call_id, canonical_json(outcomes[-1]))
+                )
+
+            conn.commit()
+            return JSONResponse(status_code=200, content=response_json({
+                "profile": PROFILE,
+                "evaluationId": evaluation_id,
+                "status": "completed",
+                "inputDigest": input_digest,
+                "outcomes": outcomes,
+            }))
+        except HTTPException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    else:
+        raise HTTPException(status_code=400, detail="Unknown operation.")
